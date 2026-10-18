@@ -634,6 +634,32 @@ impl<'a> Checker<'a> {
                 results: results.iter().map(|r| r.ty.clone()).collect(),
                 span: *span,
             }),
+            // `p := &u` (issue #552 follow-up): the inferred declared type of
+            // a pointer initializer is `*T`, so the place resolver can
+            // range-check `p.field = <constant>` (HYB-E6002).
+            Expr::AddrOf { operand, .. } => Some(TypeExpr::Pointer {
+                to: Box::new(self.ty_of_expr(st, operand)?),
+                span: operand.span(),
+            }),
+            Expr::Unary {
+                op: hy_syntax::UnOp::Addr,
+                operand,
+                ..
+            } => Some(TypeExpr::Pointer {
+                to: Box::new(self.ty_of_expr(st, operand)?),
+                span: operand.span(),
+            }),
+            // `items := [item{code: 1}]` (issue #552 follow-up): a bare slice
+            // literal carries the element type of its first element — the
+            // index/field place path needs it for `items[0].code = 300`.
+            Expr::SliceLit {
+                elem: None,
+                items,
+                span,
+            } => Some(TypeExpr::Slice {
+                elem: Box::new(self.ty_of_expr(st, items.first()?)?),
+                span: *span,
+            }),
             Expr::Move { operand, .. }
             | Expr::Try { operand, .. }
             | Expr::Paren { inner: operand, .. } => self.ty_of_expr(st, operand),

@@ -1333,3 +1333,82 @@ fn const_alias_into_untyped_decl_is_rejected() {
     );
     assert_eq!(r.verdict, Verdict::Reject);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #552 follow-up (#514 family) — inferred declared types for `:=` locals.
+// The place resolver keys on the binding's declared TypeExpr; a `:=` binding
+// only carries one when `ty_of_expr` can derive it. Both programs below used
+// to pass `hyb check` with 0 diagnostics and then fail `go build`.
+// ---------------------------------------------------------------------------
+
+const INFERRED_POINTER_FIELD_OVERFLOW: &str = "\
+struct user {
+    age int8
+}
+
+fn main() {
+    var u user
+    p := &u
+    p.age = 300
+    fmt.println(\"{u.age}\")
+}
+";
+
+const INFERRED_SLICE_OF_STRUCT_FIELD_OVERFLOW: &str = "\
+struct item {
+    code uint8
+}
+
+fn main() {
+    items := [item{code: 1}]
+    items[0].code = 300
+    fmt.println(\"{items[0].code}\")
+}
+";
+
+const INFERRED_SLICE_OF_STRUCT_FIELD_FITS: &str = "\
+struct item {
+    code uint8
+}
+
+fn main() {
+    items := [item{code: 1}]
+    items[0].code = 200
+    fmt.println(\"{items[0].code}\")
+}
+";
+
+#[test]
+fn inferred_pointer_field_overflow_is_rejected() {
+    let r = check(INFERRED_POINTER_FIELD_OVERFLOW);
+    let cs = error_codes(&r);
+    assert!(
+        cs.iter().any(|c| c == "HYB-E6002"),
+        "expected HYB-E6002 for p := &u; p.age = 300 with age int8, got {:?}",
+        cs
+    );
+    assert_eq!(r.verdict, Verdict::Reject);
+}
+
+#[test]
+fn inferred_slice_of_struct_field_overflow_is_rejected() {
+    let r = check(INFERRED_SLICE_OF_STRUCT_FIELD_OVERFLOW);
+    let cs = error_codes(&r);
+    assert!(
+        cs.iter().any(|c| c == "HYB-E6002"),
+        "expected HYB-E6002 for a bare slice literal; items[0].code = 300 with code uint8, got {:?}",
+        cs
+    );
+    assert_eq!(r.verdict, Verdict::Reject);
+}
+
+#[test]
+fn inferred_slice_of_struct_field_fits() {
+    let r = check(INFERRED_SLICE_OF_STRUCT_FIELD_FITS);
+    assert!(
+        error_codes(&r).is_empty(),
+        "an in-range store through an inferred slice must stay accepted, got {:?}",
+        error_codes(&r)
+    );
+    assert_eq!(r.verdict, Verdict::Accept);
+}
