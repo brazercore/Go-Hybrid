@@ -125,7 +125,7 @@ impl<'a> Checker<'a> {
     }
 }
 
-fn span_hint(span: Span) -> String {
+pub(crate) fn span_hint(span: Span) -> String {
     format!("{}:{}", span.start.line, span.start.col)
 }
 
@@ -133,7 +133,7 @@ fn span_hint(span: Span) -> String {
 /// name (SPEC-LANGUAGE §11 / Go's typed-constant assignment rule).
 /// Platform-word `int`/`uint`/`isize`/`usize` use the 64-bit LP64 ranges
 /// the emitter targets (SPEC B9 / X7).
-fn fixed_width_int_range(name: &str) -> Option<(i128, i128)> {
+pub(crate) fn fixed_width_int_range(name: &str) -> Option<(i128, i128)> {
     Some(match name {
         "i8" | "int8" => (i8::MIN as i128, i8::MAX as i128),
         "u8" | "uint8" | "byte" => (0, u8::MAX as i128),

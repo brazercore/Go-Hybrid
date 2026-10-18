@@ -16,6 +16,7 @@
 //! (whole-binding rebinds, A3 insert detection, A6 field stores) and
 //! returns (escape check, move marking).
 
+use crate::const_overflow::{const_int_fold, fixed_width_int_range, span_hint, ConstFold};
 use crate::foreign::{self, CallMode};
 use crate::model::{
     as_addr_of, collect_addr_of_roots, collect_ref_roots, move_operand_ident, unwrap_parens, Binding, Checker, FnState,
@@ -24,7 +25,7 @@ use crate::model::{
 use crate::shape::receiver_type_name;
 use crate::walk::{self, CallRef};
 use hy_diag::{Diagnostic, Span};
-use hy_syntax::{AssignOp, Block, Expr, FnDecl, LocalDecl, LocalKind, Place, PlaceKind, Stmt};
+use hy_syntax::{AssignOp, Block, Expr, FnDecl, LocalDecl, LocalKind, Place, PlaceKind, Stmt, TypeExpr};
 use std::collections::HashSet;
 
 /// Read-only call targets that can never mutate a map argument — the A3
@@ -3756,6 +3757,17 @@ impl<'a> Checker<'a> {
             })
             .collect();
 
+        // Issue #514: constant overflow into a fixed-width integer place
+        // (`u.age = 300`, `p.age += 200`, `items[0].code = 300`).
+        if targets.len() == values.len() {
+            for (i, (t, v)) in targets.iter().zip(values.iter()).enumerate() {
+                if is_const_write[i] {
+                    continue;
+                }
+                self.check_const_overflow_place(st, t, v);
+            }
+        }
+
         for t in targets {
             self.mark_move_in_place(st, t);
         }
@@ -5241,6 +5253,108 @@ impl<'a> Checker<'a> {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// The *declared* type of an assignment target place, resolving struct
+    /// fields (`self.structs`), pointer auto-deref, and slice/array/map
+    /// elements. `place_shape` cannot answer this: `TypeShape` erases the
+    /// fixed integer width that the constant-range check needs.
+    fn place_decl_ty(&self, st: &FnState, p: &Place) -> Option<TypeExpr> {
+        match &p.kind {
+            PlaceKind::Ident(name) => self.lookup_binding(st, name)?.ty.clone(),
+            PlaceKind::Field { base, name } => {
+                let mut ty = self.place_decl_ty(st, base)?;
+                loop {
+                    match ty {
+                        TypeExpr::Pointer { to, .. } => ty = *to,
+                        _ => break,
+                    }
+                }
+                let TypeExpr::Named { name: sname, .. } = ty else {
+                    return None;
+                };
+                let fields = self.structs.get(&sname)?;
+                fields
+                    .iter()
+                    .find(|(fname, _)| fname == name)
+                    .map(|(_, fty)| fty.clone())
+            }
+            PlaceKind::Index { base, .. } => match self.place_decl_ty(st, base)? {
+                TypeExpr::Slice { elem, .. } | TypeExpr::Array { elem, .. } => Some(*elem),
+                TypeExpr::Map { value, .. } => Some(*value),
+                _ => None,
+            },
+            PlaceKind::AddrOf { .. } => None,
+        }
+    }
+
+    /// Issue #514: a constant stored through a place that is not a plain
+    /// declaration (`u.age = 300`, `p.addr.zip = 70000`, `items[0].code = 300`,
+    /// `u.age += 200`) passed `hyb check` and then failed `go build` with
+    /// `cannot use 300 as int8 value (overflows)`. `check_const_overflow_init`
+    /// covers declarations only, so the same range check runs here once the
+    /// target's declared type is known.
+    fn check_const_overflow_place(&mut self, st: &FnState, target: &Place, value: &Expr) {
+        let Some(ty) = self.place_decl_ty(st, target) else {
+            return;
+        };
+        let TypeExpr::Named {
+            name: ty_name,
+            span: ty_span,
+        } = ty
+        else {
+            return;
+        };
+        let Some((lo, hi)) = fixed_width_int_range(&ty_name) else {
+            return;
+        };
+        let place = target.render();
+        match const_int_fold(value) {
+            ConstFold::NotConst => {}
+            ConstFold::TooBig => {
+                let span = value.span();
+                let msg = format!(
+                    "constant expression `{}` overflows declared type `{}` of `{}` (HYB-E6002)",
+                    value.render(),
+                    ty_name,
+                    place
+                );
+                let notes = vec![
+                    format!(
+                        "why: Go folds the constant expression before the range check and rejects a value outside `{}` (`cannot use … as {} value (overflows)`), so an accepted Hybrid program would emit unbuildable Go (issue #514)",
+                        ty_name, ty_name
+                    ),
+                    format!("fix: use a constant in [{}, {}] or widen the field type", lo, hi),
+                    format!("note: the target type was declared here ({})", span_hint(ty_span)),
+                ];
+                self.diags.push(
+                    Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
+                );
+            }
+            ConstFold::Val(v) => {
+                if v >= lo && v <= hi {
+                    return;
+                }
+                let span = value.span();
+                let msg = format!(
+                    "constant `{}` overflows declared type `{}` of `{}` (HYB-E6002)",
+                    value.render(),
+                    ty_name,
+                    place
+                );
+                let notes = vec![
+                    format!(
+                        "why: Go rejects a constant assignment outside `{}`'s range (`cannot use … as {} value (overflows)`), so an accepted Hybrid program would emit unbuildable Go (issue #514)",
+                        ty_name, ty_name
+                    ),
+                    format!("fix: use a constant in [{}, {}] or widen the field type", lo, hi),
+                    format!("note: the target type was declared here ({})", span_hint(ty_span)),
+                ];
+                self.diags.push(
+                    Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
+                );
+            }
         }
     }
 
